@@ -30,7 +30,7 @@ end
 BDF() = BDF(JVNewton())
 
 @enum ITask::Bool NORMAL ONE_STEP
-# TODO: Optional Inputs and Outputs
+# TODO: Optional Inputs and Outputs (in `cvode.h`)
 
 # Basic JVODE constants
 const ADAMS_Q_MAX = 12            # max value of q for lmm == Adams
@@ -39,12 +39,16 @@ const Q_MAX       =  ADAMS_Q_MAX  # max value of q for either lmm
 const L_MAX       =  (Q_MAX+1)    # max value of L for either lmm
 const NUM_TESTS   =  5            # number of error test quantities
 
-mutable struct JVMem{uType,tType,Alg,Rtol,Atol,F,D}
+mutable struct JVOptions{Atol,Rtol}
+    abstol::Atol
+    reltol::Rtol
+end
+
+mutable struct JVIntegrator{Alg,uType,tType,Rtol,Atol,F,P} <: DiffEqBase.AbstractODEIntegrator{Alg,true,uType,tType}
     f::F
-    data::D
+    p::P
     alg::Alg
-    rtol::Rtol
-    atol::Atol
+    opts::JVOptions{Atol,Rtol}
     zn::NTuple{L_MAX,Vector{uType}} # Nordsieck history array
 
     # vectors with length `length(u0)`
@@ -112,9 +116,9 @@ mutable struct JVMem{uType,tType,Alg,Rtol,Atol,F,D}
 
     #long int *cv_iopt::Int  # long int optional input, output */
     #real     *cv_ropt::Int  # real optional input, output     */
-    function JVMem(prob::ODEProblem, ::Alg, ::Rtol, ::Atol) where {Alg, Rtol, Atol}
+    function JVIntegrator(prob::ODEProblem, ::Alg, ::Rtol, ::Atol) where {Alg, Rtol, Atol}
         @unpack f, u0, tspan, p = prob
-        obj = new{eltype(u0),eltype(tspan),Alg,Rtol,Atol,typeof(f),typeof(p)}()
+        obj = new{Alg,eltype(u0),eltype(tspan),Rtol,Atol,typeof(f),typeof(p)}()
         return obj
     end
 end
@@ -230,52 +234,65 @@ end
 ### CVODE Implementation
 ###
 function DiffEqBase.__init(prob::ODEProblem, alg::JVODEAlgorithm; reltol=1e-3, abstol=1e-6)
+    # analogous to `CVodeMalloc`
     @unpack f, u0, tspan, p = prob
-    mem = JVMem(prob, alg, reltol, abstol)
+    integrator = JVIntegrator(prob, alg, reltol, abstol)
     # copy input paramters
-    mem.f, mem.uprev, mem.data = f, copy(u0), p
-    mem.tn = prob.tspan |> first
-    mem.rtol, mem.atol = reltol, abstol
-    mem.alg = alg
-    mem.hmin = HMIN_DEFAULT
-    mem.hmax_inv = HMAX_INV_DEFAULT
-    mem.mxhnil = MXHNIL_DEFAULT
-    mem.mxstep = MXSTEP_DEFAULT
-    mem.maxcor = alg.nlsolve isa JVNewton ? NEWT_MAXCOR : FUNC_MAXCOR
+    integrator.f, integrator.uprev, integrator.p = f, copy(u0), p
+    integrator.tn = prob.tspan |> first
+    integrator.opts = JVOptions(reltol, abstol)
+    integrator.alg = alg
+    integrator.hmin = HMIN_DEFAULT
+    integrator.hmax_inv = HMAX_INV_DEFAULT
+    integrator.mxhnil = MXHNIL_DEFAULT
+    integrator.mxstep = MXSTEP_DEFAULT
+    integrator.maxcor = alg.nlsolve isa JVNewton ? NEWT_MAXCOR : FUNC_MAXCOR
 
-    maxorder = mem.alg isa Adams ? ADAMS_Q_MAX : BDF_Q_MAX
+    maxorder = integrator.alg isa Adams ? ADAMS_Q_MAX : BDF_Q_MAX
 
     # allocate the vectors
-    mem.zn = ntuple(i->i<=maxorder+1 ? similar(mem.uprev) : similar(mem.uprev, 0), Val(L_MAX))
-    mem.ewt = similar(mem.uprev)
-    mem.acor = similar(mem.uprev)
-    mem.tempv = similar(mem.uprev)
-    mem.ftemp = similar(mem.uprev)
+    integrator.zn = ntuple(i->i<=maxorder+1 ? similar(integrator.uprev) : similar(integrator.uprev, 0), Val(L_MAX))
+    integrator.ewt = similar(integrator.uprev)
+    integrator.acor = similar(integrator.uprev)
+    integrator.tempv = similar(integrator.uprev)
+    integrator.ftemp = similar(integrator.uprev)
 
     # set the `ewt` vector
-    setewt!(mem, mem.uprev)
+    setewt!(integrator, integrator.uprev)
 
     # set step paramters
-    mem.q = 1
-    mem.qwait = mem.q + 1
-    mem.etamax = maxorder
+    integrator.q = 1
+    integrator.qwait = integrator.q + 1
+    integrator.etamax = maxorder
 
     # TODO: set the linear solver
 
     # initialize `zn[1]` in the history array
-    copyto!(mem.zn[1], u0)
+    copyto!(integrator.zn[1], u0)
 
     # initialize all counters
-    mem.nst = mem.nfe = mem.ncfn = mem.netf = mem.nni = mem.nsetups = mem.nhnil = mem.lrw = mem.liw = 0
+    integrator.nst = integrator.nfe = integrator.ncfn = integrator.netf = integrator.nni = integrator.nsetups = integrator.nhnil = integrator.lrw = integrator.liw = 0
 
     # initialize misc
-    mem.qu = 0
-    mem.hu = zero(mem.hu)
-    mem.tolsf = 1
-    return mem
+    integrator.qu = 0
+    integrator.hu = zero(integrator.hu)
+    integrator.tolsf = 1
+    return integrator
 end
 
-setewt!(mem::JVMem, u) = (@.. mem.tempv = inv(mem.rtol * abs(u) + mem.atol); return)
+DiffEqBase.has_reinit(integrator::JVIntegrator) = true
+function DiffEqBase.reinit!(integrator::JVIntegrator, u0=integrator.uprev;
+                            alg=integrator.alg, tspan=integrator.tspan,
+                            reltol=integrator.reltol, abstol=integrator.abstol,
+                            p=integrator.p) # TODO: opts
+    # TODO: `CVReInit`
+end
+
+# TODO: `CVHin`
+# TODO: `CVUpperBoundH0`
+# TODO: `CVStep`
+
+setewt!(integrator::JVIntegrator, u) = (@.. integrator.tempv = inv(integrator.opts.reltol * abs(u) + integrator.opts.abstol); return)
 
 """
     jvode(f, u0, tspan; rtol=1e-3, atol=1e-6)
