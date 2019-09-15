@@ -5,6 +5,7 @@ using DiffEqBase: ODEProblem, @..
 
 using Reexport: @reexport
 @reexport using DiffEqBase
+export Adams, BDF
 
 
 ###
@@ -245,7 +246,7 @@ function DiffEqBase.__init(prob::ODEProblem, alg::JVODEAlgorithm; reltol=1e-3, a
     maxorder = mem.alg isa Adams ? ADAMS_Q_MAX : BDF_Q_MAX
 
     # allocate the vectors
-    mem.zn = ntuple(i->i<=maxorder+1 ? similar(mem.uprev) : similar(mem.uprev, 0), L_MAX)
+    mem.zn = ntuple(i->i<=maxorder+1 ? similar(mem.uprev) : similar(mem.uprev, 0), Val(L_MAX))
     mem.ewt = similar(mem.uprev)
     mem.acor = similar(mem.uprev)
     mem.tempv = similar(mem.uprev)
@@ -274,7 +275,7 @@ function DiffEqBase.__init(prob::ODEProblem, alg::JVODEAlgorithm; reltol=1e-3, a
     return mem
 end
 
-setewt!(mem::JVMem, u) = @.. mem.tempv = inv(mem.rtol * abs(u) + mem.atol)
+setewt!(mem::JVMem, u) = (@.. mem.tempv = inv(mem.rtol * abs(u) + mem.atol); return)
 
 """
     jvode(f, u0, tspan; rtol=1e-3, atol=1e-6)
