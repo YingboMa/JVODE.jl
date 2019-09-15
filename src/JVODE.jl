@@ -1,7 +1,7 @@
 module JVODE
 
 using Parameters: @unpack
-using DiffEqBase: ODEProblem
+using DiffEqBase: ODEProblem, @..
 
 using Reexport: @reexport
 @reexport using DiffEqBase
@@ -10,23 +10,38 @@ using Reexport: @reexport
 ###
 ### Types
 ###
-@enum Solver::Bool ADAMS BDF
-@enum NLSolver::Bool FUNCTIONAL NEWTON
+abstract type JVNLSolver <: DiffEqBase.AbstractNLSolverAlgorithm
+end
+struct JVFunctional <: JVNLSolver
+end
+struct JVNewton <: JVNLSolver
+end
+
+abstract type JVODEAlgorithm <: DiffEqBase.AbstractODEAlgorithm
+end
+struct Adams{NLAlg} <: JVODEAlgorithm
+    nlsolve::NLAlg
+end
+Adams() = Adams(JVFunctional())
+struct BDF{NLAlg} <: JVODEAlgorithm
+    nlsolve::NLAlg
+end
+BDF() = BDF(JVNewton())
+
 @enum ITask::Bool NORMAL ONE_STEP
 # TODO: Optional Inputs and Outputs
 
 # Basic JVODE constants
-const ADAMS_Q_MAX = 12            # max value of q for lmm == ADAMS
+const ADAMS_Q_MAX = 12            # max value of q for lmm == Adams
 const BDF_Q_MAX   =  5            # max value of q for lmm == BDF
 const Q_MAX       =  ADAMS_Q_MAX  # max value of q for either lmm
 const L_MAX       =  (Q_MAX+1)    # max value of L for either lmm
 const NUM_TESTS   =  5            # number of error test quantities
 
-mutable struct JVMem{uType,tType,Rtol,Atol,F,D}
+mutable struct JVMem{uType,tType,Alg,Rtol,Atol,F,D}
     f::F
     data::D
-    solver::Solver
-    nlsolver::NLSolver
+    alg::Alg
     rtol::Rtol
     atol::Atol
     zn::NTuple{L_MAX,Vector{uType}} # Nordsieck history array
@@ -42,15 +57,15 @@ mutable struct JVMem{uType,tType,Rtol,Atol,F,D}
     q::Int                        # current order
     qprime::Int                   # order to be used on the next step {q-1, q, q+1}
     qwait::Int                    # number of steps to wait before order change
-    L::Int                        # L = q+1
+    #L::Int                        # L = q+1
     h::tType                      # current step size
     hprime::tType                 # next step size
     eta::tType                    # eta = hprime / h
     hscale::tType                 # the step size information in `zn`
     tn::tType                     # current time
-    tau::NTuple{L_MAX,tType}       # tuple of previous `q+1` successful step sizes
+    tau::NTuple{L_MAX,tType}      # tuple of previous `q+1` successful step sizes
     tq::NTuple{NUM_TESTS,tType}   # tuple of test quantities
-    coeff::NTuple{L_MAX,uType}     # coefficients of l(x)
+    coeff::NTuple{L_MAX,uType}    # coefficients of l(x)
     rl2::uType                    # 1/l[2]
     gamma::uType                  # gamma = h * rl2
     gammap::uType                 # `gamma` at the last setup call
@@ -96,11 +111,9 @@ mutable struct JVMem{uType,tType,Rtol,Atol,F,D}
 
     #long int *cv_iopt::Int  # long int optional input, output */
     #real     *cv_ropt::Int  # real optional input, output     */
-    function JVMem(prob::ODEProblem,
-                      ::Type{Rtol}=Float64, ::Type{Atol}=Float64) where {Rtol,Atol}
+    function JVMem(prob::ODEProblem, ::Alg, ::Rtol, ::Atol) where {Alg, Rtol, Atol}
         @unpack f, u0, tspan, p = prob
-        obj = new{typeof(u0),eltype(tspan),Rtol,Atol,typeof(f),typeof(p)}()
-        obj.f, obj.data = f, p
+        obj = new{eltype(u0),eltype(tspan),Alg,Rtol,Atol,typeof(f),typeof(p)}()
         return obj
     end
 end
@@ -116,10 +129,10 @@ const MXSTEP_DEFAULT   = 5000
 ###
 ### Routine-Specific Constants
 ###
+macro define(name, val)
+    esc(:(const $name = $val))
+end
 begin
-    macro define(name, val)
-        esc(:(const $name = $val))
-    end
 
     # CVodeDky */
 
@@ -215,8 +228,53 @@ end
 ###
 ### CVODE Implementation
 ###
-function populate!(mem::JVMem, args...)
+function DiffEqBase.__init(prob::ODEProblem, alg::JVODEAlgorithm; reltol=1e-3, abstol=1e-6)
+    @unpack f, u0, tspan, p = prob
+    mem = JVMem(prob, alg, reltol, abstol)
+    # copy input paramters
+    mem.f, mem.uprev, mem.data = f, copy(u0), p
+    mem.tn = prob.tspan |> first
+    mem.rtol, mem.atol = reltol, abstol
+    mem.alg = alg
+    mem.hmin = HMIN_DEFAULT
+    mem.hmax_inv = HMAX_INV_DEFAULT
+    mem.mxhnil = MXHNIL_DEFAULT
+    mem.mxstep = MXSTEP_DEFAULT
+    mem.maxcor = alg.nlsolve isa JVNewton ? NEWT_MAXCOR : FUNC_MAXCOR
+
+    maxorder = mem.alg isa Adams ? ADAMS_Q_MAX : BDF_Q_MAX
+
+    # allocate the vectors
+    mem.zn = ntuple(i->i<=maxorder+1 ? similar(mem.uprev) : similar(mem.uprev, 0), L_MAX)
+    mem.ewt = similar(mem.uprev)
+    mem.acor = similar(mem.uprev)
+    mem.tempv = similar(mem.uprev)
+    mem.ftemp = similar(mem.uprev)
+
+    # set the `ewt` vector
+    setewt!(mem, mem.uprev)
+
+    # set step paramters
+    mem.q = 1
+    mem.qwait = mem.q + 1
+    mem.etamax = maxorder
+
+    # TODO: set the linear solver
+
+    # initialize `zn[1]` in the history array
+    copyto!(mem.zn[1], u0)
+
+    # initialize all counters
+    mem.nst = mem.nfe = mem.ncfn = mem.netf = mem.nni = mem.nsetups = mem.nhnil = mem.lrw = mem.liw = 0
+
+    # initialize misc
+    mem.qu = 0
+    mem.hu = zero(mem.hu)
+    mem.tolsf = 1
+    return mem
 end
+
+setewt!(mem::JVMem, u) = @.. mem.tempv = inv(mem.rtol * abs(u) + mem.atol)
 
 """
     jvode(f, u0, tspan; rtol=1e-3, atol=1e-6)
