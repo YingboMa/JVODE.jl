@@ -44,19 +44,17 @@ mutable struct JVOptions{Atol,Rtol}
     reltol::Rtol
 end
 
-mutable struct JVIntegrator{Alg,uType,tType,Rtol,Atol,F,P} <: DiffEqBase.AbstractODEIntegrator{Alg,true,uType,tType}
-    f::F
-    p::P
-    alg::Alg
+mutable struct JVIntegrator{Alg,uType,tType,uEltype,solType,Rtol,Atol,F,P} <: DiffEqBase.AbstractODEIntegrator{Alg,true,uType,tType}
+    sol::solType
     opts::JVOptions{Atol,Rtol}
-    zn::NTuple{L_MAX,Vector{uType}} # Nordsieck history array
+    zn::NTuple{L_MAX,uType} # Nordsieck history array
 
     # vectors with length `length(u0)`
-    ewt::Vector{uType} # error weight vector
-    uprev::Vector{uType}
-    acor::Vector{uType}
-    tempv::Vector{uType}
-    ftemp::Vector{uType}
+    ewt::uType # error weight vector
+    u::uType
+    acor::uType
+    tempv::uType
+    ftemp::uType
 
     # step data
     q::Int                        # current order
@@ -67,16 +65,16 @@ mutable struct JVIntegrator{Alg,uType,tType,Rtol,Atol,F,P} <: DiffEqBase.Abstrac
     hprime::tType                 # next step size
     eta::tType                    # eta = hprime / h
     hscale::tType                 # the step size information in `zn`
-    tn::tType                     # current time
+    t::tType                      # current time
     tau::NTuple{L_MAX,tType}      # tuple of previous `q+1` successful step sizes
     tq::NTuple{NUM_TESTS,tType}   # tuple of test quantities
-    coeff::NTuple{L_MAX,uType}    # coefficients of l(x)
-    rl2::uType                    # 1/l[2]
-    gamma::uType                  # gamma = h * rl2
-    gammap::uType                 # `gamma` at the last setup call
-    gamrat::uType                 # gamma/gammap
-    crate::uType                  # estimated corrector convergence rate
-    acnrm::uType                  # | acor | wrms
+    coeff::NTuple{L_MAX,uEltype}  # coefficients of l(x)
+    rl2::uEltype                  # 1/l[2]
+    gamma::uEltype                # gamma = h * rl2
+    gammap::uEltype               # `gamma` at the last setup call
+    gamrat::uEltype               # gamma/gammap
+    crate::uEltype                # estimated corrector convergence rate
+    acnrm::uEltype                # | acor | wrms
     mnewt::Int                    # Newton iteration counter
 
     # Limits
@@ -116,9 +114,9 @@ mutable struct JVIntegrator{Alg,uType,tType,Rtol,Atol,F,P} <: DiffEqBase.Abstrac
 
     #long int *cv_iopt::Int  # long int optional input, output */
     #real     *cv_ropt::Int  # real optional input, output     */
-    function JVIntegrator(prob::ODEProblem, ::Alg, ::Rtol, ::Atol) where {Alg, Rtol, Atol}
+    function JVIntegrator(prob::ODEProblem, ::solType, ::Alg, ::Rtol, ::Atol) where {solType,Alg,Rtol,Atol}
         @unpack f, u0, tspan, p = prob
-        obj = new{Alg,eltype(u0),eltype(tspan),Rtol,Atol,typeof(f),typeof(p)}()
+        obj = new{Alg,typeof(u0),eltype(tspan),eltype(u0),solType,Rtol,Atol,typeof(f),typeof(p)}()
         return obj
     end
 end
@@ -236,29 +234,45 @@ end
 function DiffEqBase.__init(prob::ODEProblem, alg::JVODEAlgorithm; reltol=1e-3, abstol=1e-6)
     # analogous to `CVodeMalloc`
     @unpack f, u0, tspan, p = prob
-    integrator = JVIntegrator(prob, alg, reltol, abstol)
     # copy input paramters
-    integrator.f, integrator.uprev, integrator.p = f, copy(u0), p
-    integrator.tn = prob.tspan |> first
+    uType = typeof(u0)
+    uEltype = eltype(u0)
+    tType = eltype(tspan)
+    timeseries = uType[]
+    ts = tType[]
+
+    destats = DiffEqBase.DEStats(0)
+    # TODO: dense output
+    dense = true
+    #ks = Vector{uType}(undef, 0)
+    #id = InterpolationData(f,timeseries,ts,ks,dense,cache)
+
+    sol = DiffEqBase.build_solution(prob,alg,ts,timeseries,
+                                    dense=dense, #k=ks, interp=id, TODO
+                                    calculate_error = false, destats=destats)
+    integrator = JVIntegrator(prob, sol, alg, reltol, abstol)
+
+    integrator.sol = sol
+    integrator.t = prob.tspan |> first
     integrator.opts = JVOptions(reltol, abstol)
-    integrator.alg = alg
     integrator.hmin = HMIN_DEFAULT
     integrator.hmax_inv = HMAX_INV_DEFAULT
     integrator.mxhnil = MXHNIL_DEFAULT
     integrator.mxstep = MXSTEP_DEFAULT
     integrator.maxcor = alg.nlsolve isa JVNewton ? NEWT_MAXCOR : FUNC_MAXCOR
 
-    maxorder = integrator.alg isa Adams ? ADAMS_Q_MAX : BDF_Q_MAX
+    maxorder = alg isa Adams ? ADAMS_Q_MAX : BDF_Q_MAX
 
     # allocate the vectors
-    integrator.zn = ntuple(i->i<=maxorder+1 ? similar(integrator.uprev) : similar(integrator.uprev, 0), Val(L_MAX))
-    integrator.ewt = similar(integrator.uprev)
-    integrator.acor = similar(integrator.uprev)
-    integrator.tempv = similar(integrator.uprev)
-    integrator.ftemp = similar(integrator.uprev)
+    integrator.u = copy(u0)
+    integrator.zn = ntuple(i->i<=maxorder+1 ? similar(integrator.u) : similar(integrator.u, 0), Val(L_MAX))
+    integrator.ewt = similar(integrator.u)
+    integrator.acor = similar(integrator.u)
+    integrator.tempv = similar(integrator.u)
+    integrator.ftemp = similar(integrator.u)
 
     # set the `ewt` vector
-    setewt!(integrator, integrator.uprev)
+    setewt!(integrator, integrator.u)
 
     # set step paramters
     integrator.q = 1
