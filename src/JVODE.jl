@@ -1,5 +1,7 @@
 module JVODE
 
+using LinearAlgebra
+
 using Parameters: @unpack
 using DiffEqBase: ODEProblem, @..
 
@@ -29,7 +31,6 @@ struct BDF{NLAlg} <: JVODEAlgorithm
 end
 BDF() = BDF(JVNewton())
 
-@enum ITask::Bool NORMAL ONE_STEP
 # TODO: Optional Inputs and Outputs (in `cvode.h`)
 
 # Basic JVODE constants
@@ -39,9 +40,9 @@ const Q_MAX       =  ADAMS_Q_MAX  # max value of q for either lmm
 const L_MAX       =  (Q_MAX+1)    # max value of L for either lmm
 const NUM_TESTS   =  5            # number of error test quantities
 
-mutable struct JVOptions{Atol,Rtol}
-    abstol::Atol
+mutable struct JVOptions{Rtol,Atol}
     reltol::Rtol
+    abstol::Atol
 end
 
 mutable struct JVIntegrator{Alg,uType,tType,uEltype,solType,Rtol,Atol,F,P} <: DiffEqBase.AbstractODEIntegrator{Alg,true,uType,tType}
@@ -61,10 +62,10 @@ mutable struct JVIntegrator{Alg,uType,tType,uEltype,solType,Rtol,Atol,F,P} <: Di
     qprime::Int                   # order to be used on the next step {q-1, q, q+1}
     qwait::Int                    # number of steps to wait before order change
     #L::Int                        # L = q+1
-    h::tType                      # current step size
-    hprime::tType                 # next step size
-    eta::tType                    # eta = hprime / h
-    hscale::tType                 # the step size information in `zn`
+    dt::tType                     # current step size
+    dtprime::tType                # next step size
+    eta::tType                    # eta = dtprime / dt
+    dtscale::tType                # the step size information in `zn`
     t::tType                      # current time
     tau::NTuple{L_MAX,tType}      # tuple of previous `q+1` successful step sizes
     tq::NTuple{NUM_TESTS,tType}   # tuple of test quantities
@@ -84,8 +85,8 @@ mutable struct JVIntegrator{Alg,uType,tType,uEltype,solType,Rtol,Atol,F,P} <: Di
     mxhnil::Int                   # maximum number of warning messages issued to the
                                   # user that `t + h == t` for the next internal step
 
-    hmin::tType                   # |h| >= hmin
-    hmax_inv::tType               # |h| <= 1/hmax_inv
+    dtmin::tType                  # |h| >= hmin
+    dtmax_inv::tType              # |h| <= 1/hmax_inv
     etamax::tType                 # eta <= etamax
 
     # counters
@@ -103,7 +104,7 @@ mutable struct JVIntegrator{Alg,uType,tType,uEltype,solType,Rtol,Atol,F,P} <: Di
     # saved vales
     qu::Int                       # last successful q value used
     nstlp::Int                    # step number of last setup call
-    hu::tType                     # last successful h value used
+    dtu::tType                    # last successful h value used
     saved_tq5::tType              # saved value of tq[5]
     jcur::Bool                    # Is the Jacobian info used by
                                   # linear solver current?
@@ -255,8 +256,8 @@ function DiffEqBase.__init(prob::ODEProblem, alg::JVODEAlgorithm; reltol=1e-3, a
     integrator.sol = sol
     integrator.t = prob.tspan |> first
     integrator.opts = JVOptions(reltol, abstol)
-    integrator.hmin = HMIN_DEFAULT
-    integrator.hmax_inv = HMAX_INV_DEFAULT
+    integrator.dtmin = HMIN_DEFAULT
+    integrator.dtmax_inv = HMAX_INV_DEFAULT
     integrator.mxhnil = MXHNIL_DEFAULT
     integrator.mxstep = MXSTEP_DEFAULT
     integrator.maxcor = alg.nlsolve isa JVNewton ? NEWT_MAXCOR : FUNC_MAXCOR
@@ -289,7 +290,7 @@ function DiffEqBase.__init(prob::ODEProblem, alg::JVODEAlgorithm; reltol=1e-3, a
 
     # initialize misc
     integrator.qu = 0
-    integrator.hu = zero(integrator.hu)
+    integrator.dtu = zero(integrator.dtu)
     integrator.tolsf = 1
     return integrator
 end
@@ -302,11 +303,164 @@ function DiffEqBase.reinit!(integrator::JVIntegrator, u0=integrator.uprev;
     # TODO: `CVReInit`
 end
 
-# TODO: `CVHin`
-# TODO: `CVUpperBoundH0`
-# TODO: `CVStep`
+function DiffEqBase.step!(integrator::JVIntegrator, dt=nothing)#, stop_at_tdt=false)
+    @unpack f, p, tspan = integrator.sol.prob
+    @unpack zn, t, dtmax_inv, dtmin, nst, mxstep, mxhnil = integrator
+    tout = dt === nothing ? tspan[end] : t + dt
+    if nst === 0 # first step
+        f(zn[2], zn[1], p, t)
+        integrator.nfe = 1
+        integrator.dt = zero(integrator.dt)
+        # TODO: user initdt
+        if iszero(integrator.dt)
+            dt_ok = initdt!(integrator, tout)
+            dt_ok || error("tout=$tout too close to t0=$t to start integration")
+        end
+        #rh = abs(integrator.dt) * dtmax_inv
+        #rh > one(rh) && (integrator.dt /= rh)
+        abs(integrator.dt) < dtmin && (integrator.dt *= dtmin / abs(integrator.dt))
+        integrator.dtscale = integrator.dt
+        lmul!(integrator.dt, zn[2])
+    end
+    # If not the first call, check if tout already reached
+    if dt !== nothing && nst > 0 && (integrator.t - tout)*integrator.dt >= zero(integrator.dt)
+        # integrator.t = tout
+        # interpolate???
+        return integrator
+    end
 
-setewt!(integrator::JVIntegrator, u) = (@.. integrator.tempv = inv(integrator.opts.reltol * abs(u) + integrator.opts.abstol); return)
+    nstloc = 0
+    while true
+        nextdt = integrator.dt
+        nextq  = integrator.q
+
+        # reset and check ewt
+        nst > 0 && setewt!(integrator, zn[1])
+
+        # check for too many steps
+        if nstloc >= mxstep
+            @warn "At t=$t, mxstep=$mxstep steps taken on this call before reaching tout=$tout"
+            copyto!(integrator.u, integrator.zn[1])
+            break
+        end
+
+        # TODO: check for too much accuracy requested
+
+        # check for `dt` below roundoff
+        t = integrator.t
+        if t + integrator.dt == t
+            integrator.nhnil += 1
+            integrator.nhnil <= mxhnil && @warn "internal t=$t and step size dt=$(integrator.dt) are such that t + dt = t on the next step. The solver will continue anyway."
+            integrator.nhnil == mxhnil && @warn "The above warning has been issued $mxhnil times and will not be issued again for this problem."
+        end
+
+        kflag = jvstep(integrator)
+        t = integrator.t
+        if kflag !== SUCCESS_STEP
+            handlefailure(integrator, kflag)
+            copyto!(integrator.u, zn[1])
+            break
+        end
+
+        nstloc += 1
+
+        if dt === nothing
+            copyto!(integrator.u, zn[1])
+            nextq  = integrator.qprime
+            nextdt = integrator.dtprime
+        end
+
+        if (t-tout)*integrator.dt >= zero(integrator.t)
+            copyto!(integrator.u, zn[1])
+            nextq  = integrator.qprime
+            nextdt = integrator.dtprime
+            break
+        end
+    end
+    return integrator
+end
+
+function jvstep(integrator::JVIntegrator)
+    # TODO
+    return SUCCESS_STEP
+end
+
+function initdt!(integrator::JVIntegrator, tout)::Bool
+    @unpack zn, t = integrator
+    # test for tout too close to t
+    tdiff = tout - t
+    iszero(tdiff) && return false
+    tdir = sign(tdiff)
+    tdist = abs(tdiff)
+    tround = eps() * max(abs(t), abs(tout))
+    tdist < 2tround && return false
+
+    # Set lower and upper bounds on h0, and take geometric mean. Exit with this
+    # value if the bounds cross each other.
+    hlb = HLB_FACTOR * tround
+    hub = let integrator=integrator, tdist=tdist
+        temp1 = integrator.tempv
+        temp2 = integrator.acor
+        map!(abs, temp1, zn[1])
+        map!(abs, temp2, zn[2])
+        @.. temp1 = temp2 / muladd(HUB_FACTOR, temp1, integrator.opts.abstol)
+        hub_inv = norm(temp1, Inf)
+        hub = HUB_FACTOR * tdist
+        hub*hub_inv > one(hub) && (hub = inv(hub_inv))
+        hub
+    end
+    hg = sqrt(hlb*hub)
+    if hub < hlb
+        tdir == -1 && (hg = -hg)
+        integrator.dt = hg
+        return true
+    end
+
+    # Loop up to MAX_ITERS times to find h0.
+    # Stop if new and previous values differ by a factor < 2.
+    # Stop if hnew/hg > 2 after one iteration, as this probably means
+    # that the ydd value is bad because of cancellation error.
+    count = 0
+    yddnorm = (integrator, hg) -> begin
+        # This routine computes an estimate of the second derivative of y
+        # using a difference quotient, and returns its WRMS norm.
+        @unpack zn, tempv, ewt, u, t = integrator
+        @unpack f, p = integrator.sol.prob
+        @.. u = muladd(hg, zn[2], zn[1])
+        f(tempv, u, p, t+hg)
+        integrator.nfe += 1
+        @. tempv = tempv - zn[2]
+        lmul!(inv(hg), tempv)
+        yddnrm = wrmsnorm(tempv, ewt)
+    end
+    local hnew
+    while true
+        hgs = hg*tdir
+        yddnrm = yddnorm(integrator, hgs)
+        hnew = (yddnrm*hub*hub > 2) ? sqrt(2/yddnrm) : sqrt(hg*hub)
+        count += 1
+        count >= MAX_ITERS && break
+        hrat = hnew/hg
+        (hrat > 0.5) && (hrat < 2) && break
+        if (count >= 2) && (hrat > 2)
+            hnew = hg
+            break
+        end
+        hg = hnew
+    end
+
+    # Apply bounds, bias factor, and attach sign */
+
+    h0 = H_BIAS*hnew
+    h0 < hlb && (h0 = hlb)
+    h0 > hub && (h0 = hub)
+    tdir == -1 && (h0 = -h0)
+    integrator.dt = h0
+    return true
+end
+
+setewt!(integrator::JVIntegrator, u) = (@.. integrator.ewt = inv(integrator.opts.reltol * abs(u) + integrator.opts.abstol); return)
+wrmsnorm(x, w) = sum(((x,w),)->abs2(x*w), zip(x, w))/length(x) |> sqrt
 
 """
     jvode(f, u0, tspan; rtol=1e-3, atol=1e-6)
