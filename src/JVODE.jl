@@ -1,7 +1,6 @@
 module JVODE
 
 using LinearAlgebra
-using Setfield: @set!
 
 using Parameters: @unpack
 using DiffEqBase: ODEProblem, @..
@@ -10,6 +9,29 @@ using Reexport: @reexport
 @reexport using DiffEqBase
 export Adams, BDF
 
+### Convenient macro
+macro set!(ex)
+    _set(ex) |> esc
+end
+
+function _set(ex)
+    list = []
+    _set!(list, ex)
+    ret = quote end
+    for eq in list
+        push!(ret.args, :($(eq[1]) = $(eq[2])))
+    end
+    return ret
+end
+
+function _set!(list, ex)
+    if ex isa Expr && ex.head == :(=) && length(ex.args) == 2 && (lhs = ex.args[1]).head == :ref && length(lhs.args) == 2
+        rhs = ex.args[2]
+        rhs = _set!(list, rhs)
+        push!(list, (lhs.args[1], :( Base.setindex($(lhs.args[1]), convert(eltype($(lhs.args[1])), $(isempty(list) ? rhs : list[end][end])), $(lhs.args[2])) ), lhs))
+    end
+    return ex
+end
 
 ###
 ### Types
@@ -21,13 +43,13 @@ end
 struct JVNewton <: JVNLSolver
 end
 
-abstract type JVODEAlgorithm <: DiffEqBase.AbstractODEAlgorithm
+abstract type AbstractJVODEAlgorithm <: DiffEqBase.AbstractODEAlgorithm
 end
-struct Adams{NLAlg} <: JVODEAlgorithm
+struct Adams{NLAlg} <: AbstractJVODEAlgorithm
     nlsolve::NLAlg
 end
 Adams() = Adams(JVFunctional())
-struct BDF{NLAlg} <: JVODEAlgorithm
+struct BDF{NLAlg} <: AbstractJVODEAlgorithm
     nlsolve::NLAlg
 end
 BDF() = BDF(JVNewton())
@@ -70,8 +92,9 @@ mutable struct JVIntegrator{Alg,uType,tType,uEltype,solType,Rtol,Atol,F,P} <: Di
     t::tType                      # current time
     tau::NTuple{L_MAX,tType}      # tuple of previous `q+1` successful step sizes
     tq::NTuple{NUM_TESTS,tType}   # tuple of test quantities
-    coeff::NTuple{L_MAX,uEltype}  # coefficients of l(x)
-    rl2::uEltype                  # 1/l[2]
+    l::NTuple{L_MAX,uEltype}      # coefficients of l(x)
+    rl1::uEltype                  # 1/l[2]
+    rl2::uEltype                  # 1/l[3]
     gamma::uEltype                # gamma = h * rl2
     gammap::uEltype               # `gamma` at the last setup call
     gamrat::uEltype               # gamma/gammap
@@ -233,7 +256,7 @@ end
 ###
 ### CVODE Implementation
 ###
-function DiffEqBase.__init(prob::ODEProblem, alg::JVODEAlgorithm; reltol=1e-3, abstol=1e-6)
+function DiffEqBase.__init(prob::ODEProblem, alg::AbstractJVODEAlgorithm; reltol=1e-3, abstol=1e-6)
     # analogous to `CVodeMalloc`
     @unpack f, u0, tspan, p = prob
     # copy input paramters
@@ -393,7 +416,7 @@ function jvstep(integrator::JVIntegrator)
             integrator.t += integrator.dt # advance time
             # TODO: tstop
             for k in 1:integrator.q, j in integrator.q:-1:k
-                @.. z[j] += z[j+1]
+                @.. integrator.zn[j] += integrator.zn[j+1]
             end
         end # end predict
         setparams!(integrator)
@@ -459,7 +482,7 @@ as follows:
   - tq[5] = coefficient used to get the order `q+2` derivative vector used in the est. local error at order `q+1`
 """
 function setparams!(integrator::JVIntegrator)
-    setparams!(integrator, integrator.alg)
+    setparams!(integrator, integrator.sol.alg)
     integrator.rl1 = inv(integrator.l[2])
     integrator.gamma = integrator.dt * integrator.rl1
     integrator.nst == 0 && (integrator.gammap = integrator.gamma)
@@ -467,14 +490,15 @@ function setparams!(integrator::JVIntegrator)
         integrator.gamma/integrator.gammap : one(integrator.gamma)
     return nothing
 end
-setparams!(integrator::JVIntegrator, ::T) where {T<:AbstractODEAlgorithm} = error("$(nameof(T)) isn't implemented in JVODE.jl")
+@noinline setparams!(integrator::JVIntegrator, ::T) where {T<:AbstractJVODEAlgorithm} = error("$(nameof(T)) isn't implemented in JVODE.jl")
+@inline setparams!(integrator::JVIntegrator, ::Adams) = _setparams_adams!(integrator)
 
-function setparams!(integrator::JVIntegrator, ::Adams)
+function _setparams_adams!(integrator::JVIntegrator)
     if integrator.q == 1
-        integrator.l[1] = integrator.l[2] = integrator.tq[1] = integrator.tq[5] = 1
-        integrator.tq[2] = 1/2
-        integrator.tq[3] = 1/12
-        integrator.tq[4] = 0.1 / integrator.tq[2]
+        @set! integrator.l[1] = integrator.l[2] = integrator.tq[1] = integrator.tq[5] = 1
+        @set! integrator.tq[2] = 1/2
+        @set! integrator.tq[3] = 1/12
+        @set! integrator.tq[4] = 0.1 / integrator.tq[2]
     end
 
     # m[i] are coefficients of product(1 to j) (1 + x/xi_i)
@@ -484,9 +508,11 @@ function setparams!(integrator::JVIntegrator, ::Adams)
     #   sum (i= 0 ... iend) [ (-1)^i * (a[i] / (i + k)) ].
     intpoly = (iend, a, k) -> begin
         int = zero(eltype(a))
-        ient < 0 && return int
+        iend < 0 && return int
+        sign = true
         for i in 0:iend
-            int += -isodd(i) * (a[i + 1] / (i+k))
+            int += sign * (a[i + 1] / (i+k))
+            sign = !sign
         end
         return int
     end
@@ -496,7 +522,7 @@ function setparams!(integrator::JVIntegrator, ::Adams)
         for j in 1:integrator.q-1
             if j == integrator.q-1 && integrator.qwait == 1
                 int = intpoly(integrator.q-2, m, 2)
-                integrator.tq[1] = integrator.q * int / m[integrator.q-2 + 1]
+                @set! integrator.tq[1] = integrator.q * int / m[integrator.q-2 + 1]
             end
             xi_inv = integrator.dt / hsum
             for i in j:-1:1
@@ -504,30 +530,31 @@ function setparams!(integrator::JVIntegrator, ::Adams)
             end
             hsum += integrator.tau[j]
         end
+        hsum
     end
     M0 = intpoly(integrator.q-1, m, 1)
     M1 = intpoly(integrator.q-1, m, 2)
     # finish the calculation of Adams `l` and `tq`
     M0_inv = inv(M0)
-    integrator.l[0 + 1] = 1
+    @set! integrator.l[0 + 1] = 1
     for i in 1:integrator.q
-        integrator.l[i + 1] = M0_inv * (m[i] / i)
+        @set! integrator.l[i + 1] = M0_inv * (m[i] / i)
     end
     xi = hsum / integrator.dt
     xi_inv = inv(xi)
 
-    integrator.tq[2] = M1 * M0_inv / xi
-    integrator.tq[5] = xi / integrator.l[integrator.q + 1]
+    @set! integrator.tq[2] = M1 * M0_inv / xi
+    @set! integrator.tq[5] = xi / integrator.l[integrator.q + 1]
 
     if integrator.qwait == 1
-        for i in integrator.1:-1:1
-            m[i + 1] += m[i] * xi_inv
+        for i in integrator.q:-1:1
+            @set! m[i + 1] += m[i] * xi_inv
         end
         M2 = intpoly(integrator.q, m, 2)
-        integrator.tq[3] = M2 * M0_inv / (integrator.q + 1)
+        @set! integrator.tq[3] = M2 * M0_inv / (integrator.q + 1)
     end
 
-    integrator.tq[4] = 0.1 / integrator.tq[2]
+    @set! integrator.tq[4] = 0.1 / integrator.tq[2]
     return nothing
 end
 

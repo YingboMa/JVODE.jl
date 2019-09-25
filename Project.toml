@@ -8,7 +8,6 @@ DiffEqBase = "2b5f629d-d688-5b77-993f-72d75c75574e"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Parameters = "d96e819e-fc66-5662-9728-84c9c7592b0a"
 Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
-Setfield = "efcf1570-3423-57d1-acb7-fd33fddbac46"
 
 [extras]
 Sundials = "c3572dad-4567-51f8-b174-8c6c989267f4"
