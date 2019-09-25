@@ -1,6 +1,7 @@
 module JVODE
 
 using LinearAlgebra
+using Setfield: @set!
 
 using Parameters: @unpack
 using DiffEqBase: ODEProblem, @..
@@ -381,8 +382,153 @@ function DiffEqBase.step!(integrator::JVIntegrator, dt=nothing)#, stop_at_tdt=fa
 end
 
 function jvstep(integrator::JVIntegrator)
+    saved_t = integrator.t
+    ncf = nef = 0
+    nflag = FIRST_CALL
+
+    (integrator.nst > 0) && integrator.dtprime != integrator.dt && adjustparams!(integrator)
+
+    while true
+        let integrator=integrator # predict
+            integrator.t += integrator.dt # advance time
+            # TODO: tstop
+            for k in 1:integrator.q, j in integrator.q:-1:k
+                @.. z[j] += z[j+1]
+            end
+        end # end predict
+        setparams!(integrator)
+
+        nflag = nlsolve!(integrator, nflag)
+        kfalg = handle_nflag(integrator, nflag, saved_t, ncf)
+
+        # Go back in loop if we need to predict again (nflag=PREV_CONV_FAIL)
+        kflag == PREDICT_AGAIN && continue
+
+        # Return if nonlinear solve failed and recovery is not possible.
+        kflag != DO_ERROR_TEST && return kflag
+
+        # Perform error test (nflag=CV_SUCCESS)
+        eflag, dsm = doerrortest!(integrator, nflag, saved_t, nef)
+
+        # Go back in loop if we need to predict again (nflag=PREV_ERR_FAIL)
+        eflag == TRY_AGAIN && continue
+
+        # Return if error test failed and recovery is not possible.
+        eflag != CV_SUCCESS && return eflag
+
+        # Error test passed (eflag=CV_SUCCESS), break from loop
+        break
+    end
+
+    # Nonlinear system solve and error test were both successful.
+    # Update data, and consider change of step and/or order.
+
+    completestep!(integrator)
+
+    preparenextstep(integrator, dsm)
+
+    # If Stablilty Limit Detection is turned on, call stability limit
+    # detection routine for possible order reduction.
+
     # TODO
+    #cv_mem->cv_sldeton && cvBDFStab(cv_mem);
+
+    integrator.etamax = integrator.nst <= SMALL_NST ? ETAMX2 : ETAMX3
+
+    # Finally, we rescale the acor array to be the
+    # estimated local error vector.
+
+    lmul!(integrator.tq[2], integrator.acor)
     return SUCCESS_STEP
+end
+
+"""
+    setparams!(integrator::JVIntegrator)
+
+Set the polynomial l, the test quantity array tq, and the
+related variables  rl1, gamma, and gamrat.
+
+The array tq is loaded with constants used in the control of
+estimated local errors and in the nonlinear convergence test.
+Specifically, while running at order q, the components of tq are
+as follows:
+  - tq[1] = a coefficient used to get the est. local error at order `q-1`
+  - tq[2] = a coefficient used to get the est. local error at order `q`
+  - tq[3] = a coefficient used to get the est. local error at order `q+1`
+  - tq[4] = constant used in nonlinear iteration convergence test
+  - tq[5] = coefficient used to get the order `q+2` derivative vector used in the est. local error at order `q+1`
+"""
+function setparams!(integrator::JVIntegrator)
+    setparams!(integrator, integrator.alg)
+    integrator.rl1 = inv(integrator.l[2])
+    integrator.gamma = integrator.dt * integrator.rl1
+    integrator.nst == 0 && (integrator.gammap = integrator.gamma)
+    integrator.gamrat = integrator.nst > 0 ?
+        integrator.gamma/integrator.gammap : one(integrator.gamma)
+    return nothing
+end
+setparams!(integrator::JVIntegrator, ::T) where {T<:AbstractODEAlgorithm} = error("$(nameof(T)) isn't implemented in JVODE.jl")
+
+function setparams!(integrator::JVIntegrator, ::Adams)
+    if integrator.q == 1
+        integrator.l[1] = integrator.l[2] = integrator.tq[1] = integrator.tq[5] = 1
+        integrator.tq[2] = 1/2
+        integrator.tq[3] = 1/12
+        integrator.tq[4] = 0.1 / integrator.tq[2]
+    end
+
+    # m[i] are coefficients of product(1 to j) (1 + x/xi_i)
+    m = ntuple(_->zero(eltype(integrator.u)), Val(L_MAX))
+    # helper routine to integrate the polynomial `x^(k-1) M(x)`
+    # from -1 to 0 from the coefficients of M(x). It computes
+    #   sum (i= 0 ... iend) [ (-1)^i * (a[i] / (i + k)) ].
+    intpoly = (iend, a, k) -> begin
+        int = zero(eltype(a))
+        ient < 0 && return int
+        for i in 0:iend
+            int += -isodd(i) * (a[i + 1] / (i+k))
+        end
+        return int
+    end
+    hsum = begin
+        hsum = integrator.dt
+        @set! m[0 + 1] = 1
+        for j in 1:integrator.q-1
+            if j == integrator.q-1 && integrator.qwait == 1
+                int = intpoly(integrator.q-2, m, 2)
+                integrator.tq[1] = integrator.q * int / m[integrator.q-2 + 1]
+            end
+            xi_inv = integrator.dt / hsum
+            for i in j:-1:1
+                @set! m[i + 1] += m[i] * xi_inv
+            end
+            hsum += integrator.tau[j]
+        end
+    end
+    M0 = intpoly(integrator.q-1, m, 1)
+    M1 = intpoly(integrator.q-1, m, 2)
+    # finish the calculation of Adams `l` and `tq`
+    M0_inv = inv(M0)
+    integrator.l[0 + 1] = 1
+    for i in 1:integrator.q
+        integrator.l[i + 1] = M0_inv * (m[i] / i)
+    end
+    xi = hsum / integrator.dt
+    xi_inv = inv(xi)
+
+    integrator.tq[2] = M1 * M0_inv / xi
+    integrator.tq[5] = xi / integrator.l[integrator.q + 1]
+
+    if integrator.qwait == 1
+        for i in integrator.1:-1:1
+            m[i + 1] += m[i] * xi_inv
+        end
+        M2 = intpoly(integrator.q, m, 2)
+        integrator.tq[3] = M2 * M0_inv / (integrator.q + 1)
+    end
+
+    integrator.tq[4] = 0.1 / integrator.tq[2]
+    return nothing
 end
 
 function initdt!(integrator::JVIntegrator, tout)::Bool
@@ -461,57 +607,5 @@ end
 
 setewt!(integrator::JVIntegrator, u) = (@.. integrator.ewt = inv(integrator.opts.reltol * abs(u) + integrator.opts.abstol); return)
 wrmsnorm(x, w) = sum(((x,w),)->abs2(x*w), zip(x, w))/length(x) |> sqrt
-
-"""
-    jvode(f, u0, tspan; rtol=1e-3, atol=1e-6)
-
-DVODE: Variable-coefficient Ordinary Differential Equation solver,
-with fixed-leading-coefficient implementation.
-This version is in double precision.
-
-DVODE solves the initial value problem for stiff or nonstiff
-systems of first order ODEs,
-    dy/dt = f(t,y) ,  or, in component form,
-    dy(i)/dt = f(i) = f(i,t,y(1),y(2),...,y(NEQ)) (i = 1,...,NEQ).
-DVODE is a package based on the EPISODE and EPISODEB packages, and
-on the ODEPACK user interface standard, with minor modifications.
-----------------------------------------------------------------------
-Authors:
-              Peter N. Brown and Alan C. Hindmarsh
-              Center for Applied Scientific Computing, L-561
-              Lawrence Livermore National Laboratory
-              Livermore, CA 94551
-and
-              George D. Byrne
-              Illinois Institute of Technology
-              Chicago, IL 60616
-----------------------------------------------------------------------
-References:
-
-1. P. N. Brown, G. D. Byrne, and A. C. Hindmarsh, "VODE: A Variable
-   Coefficient ODE Solver," SIAM J. Sci. Stat. Comput., 10 (1989),
-   pp. 1038-1051.  Also, LLNL Report UCRL-98412, June 1988.
-2. G. D. Byrne and A. C. Hindmarsh, "A Polyalgorithm for the
-   Numerical Solution of Ordinary Differential Equations,"
-   ACM Trans. Math. Software, 1 (1975), pp. 71-96.
-3. A. C. Hindmarsh and G. D. Byrne, "EPISODE: An Effective Package
-   for the Integration of Systems of Ordinary Differential
-   Equations," LLNL Report UCID-30112, Rev. 1, April 1977.
-4. G. D. Byrne and A. C. Hindmarsh, "EPISODEB: An Experimental
-   Package for the Integration of Systems of Ordinary Differential
-   Equations with Banded Jacobians," LLNL Report UCID-30132, April
-   1976.
-5. A. C. Hindmarsh, "ODEPACK, a Systematized Collection of ODE
-   Solvers," in Scientific Computing, R. S. Stepleman et al., eds.,
-   North-Holland, Amsterdam, 1983, pp. 55-64.
-6. K. R. Jackson and R. Sacks-Davis, "An Alternative Implementation
-   of Variable Step-Size Multistep Formulas for Stiff ODEs," ACM
-   Trans. Math. Software, 6 (1980), pp. 295-318.
-"""
-function jvode(f, u0, tspan; rtol=1e-3, atol=1e-6)
-    maxorder = (12, 5)
-    maxstep0 = 500
-    maxwarns = 10
-end
 
 end # module
