@@ -36,11 +36,11 @@ end
 ###
 ### Types
 ###
-abstract type JVNLSolver <: DiffEqBase.AbstractNLSolverAlgorithm
+abstract type AbstractJVNLSolver <: DiffEqBase.AbstractNLSolverAlgorithm
 end
-struct JVFunctional <: JVNLSolver
+struct JVFunctional <: AbstractJVNLSolver
 end
-struct JVNewton <: JVNLSolver
+struct JVNewton <: AbstractJVNLSolver
 end
 
 abstract type AbstractJVODEAlgorithm <: DiffEqBase.AbstractODEAlgorithm
@@ -422,7 +422,7 @@ function jvstep(integrator::JVIntegrator)
         setparams!(integrator)
 
         nflag = nlsolve!(integrator, nflag)
-        kfalg = handle_nflag(integrator, nflag, saved_t, ncf)
+        kflag, nflag, ncf = handle_nflag(integrator, nflag, saved_t, ncf)
 
         # Go back in loop if we need to predict again (nflag=PREV_CONV_FAIL)
         kflag == PREDICT_AGAIN && continue
@@ -491,7 +491,7 @@ function setparams!(integrator::JVIntegrator)
     return nothing
 end
 @noinline setparams!(integrator::JVIntegrator, ::T) where {T<:AbstractJVODEAlgorithm} = error("$(nameof(T)) isn't implemented in JVODE.jl")
-@inline setparams!(integrator::JVIntegrator, ::Adams) = _setparams_adams!(integrator)
+setparams!(integrator::JVIntegrator, ::Adams) = _setparams_adams!(integrator)
 
 function _setparams_adams!(integrator::JVIntegrator)
     if integrator.q == 1
@@ -555,6 +555,111 @@ function _setparams_adams!(integrator::JVIntegrator)
     end
 
     @set! integrator.tq[4] = 0.1 / integrator.tq[2]
+    return nothing
+end
+
+nlsolve!(integrator::JVIntegrator, nflag) = nlsolve!(integrator, integrator.sol.alg.nlsolve, nflag)
+nlsolve!(integrator::JVIntegrator, ::JVFunctional, ::Any) = _nlsolve_functional!(integrator)
+function _nlsolve_functional!(integrator::JVIntegrator)
+    @unpack u, zn, tempv, acor, ewt, dt, t, rl1, tq, maxcor = integrator
+    crate = one(eltype(u))
+    m = 0
+    integrator.sol.prob.f(tempv, zn[1], integrator.sol.prob.p, t)
+    integrator.nfe += 1
+    fill!(acor, 0)
+
+    local delp
+    while true
+        # Correct y directly from the last f value
+        @. tempv = muladd(dt, tempv, -zn[1])
+        lmul!(rl1, tempv)
+        @. u = zn[1] + tempv
+        # Get WRMS norm of current correction to use in convergence test
+        @. acor = tempv - acor
+        del = wrmsnorm(acor, ewt)
+        copyto!(acor, tempv)
+
+        # Test for convergence.  If m > 0, an estimate of the convergence rate
+        # constant is stored in crate, and used in the test.
+        m > 0 && (crate = max(CRDOWN * crate, del / delp))
+        dcon = del * min(one(eltype(u)), crate) / tq[4]
+        if dcon <= one(eltype(u))
+            acnrm = m == 0 ? del : wrmsnorm(acor, ewt)
+            return SOLVED # Convergence achieved
+        end
+
+        # Stop at maxcor iterations or if iter. seems to be diverging
+        m += 1
+        (m == maxcor || ((m >= 2) && (del > RDIV * delp))) && return CONV_FAIL
+        # Save norm of correction, evaluate f, and loop again
+        delp = del
+        integrator.sol.prob.f(tempv, u, integrator.sol.prob.p, t)
+        integrator.nfe += 1
+    end
+end
+
+function handle_nflag(integrator::JVIntegrator, nflag, saved_t, ncf)
+    nflag == SOLVED && return DO_ERROR_TEST, nflag, ncf
+
+    # The nonlinear soln. failed; increment ncfn and restore zn
+    integrator.ncfn += 1
+    restore!(integrator, saved_t);
+
+    # Return if lsetup or lsolve failed unrecoverably
+    nflag == SETUP_FAIL_UNREC && return SETUP_FAILED, nflag, ncf
+    nflag == SOLVE_FAIL_UNREC && return SOLVE_FAILED, nflag, ncf
+
+    # At this point, nflag == CONV_FAIL; increment ncf
+
+    ncf += 1
+    etamax = 1
+    # If we had MXNCF failures or |h| = hmin, return REP_CONV_FAIL
+    ((abs(integrator.dt) <= integrator.dtmin * ONEPSM) || (ncf == MXNCF)) && return REP_CONV_FAIL, nflag, ncf
+
+    # Reduce step size; return to reattempt the step
+    eta = max(ETACF, hmin / abs(integrator.dt))
+    nflag = PREV_CONV_FAIL
+    rescale!(integrator)
+    return PREDICT_AGAIN, nflag, ncf
+end
+
+function doerrortest!(integrator::JVIntegrator, nflag, saved_t, nef)
+    # TODO
+    dsm = integrator.acnrm / integrator.tq[2]
+    dsm <= one(dsm) && return true
+    return eflag, dsm
+end
+
+"""
+    rescale!(integrator::JVIntegrator)
+
+Rescale the Nordsieck array by multiplying the ``j``th column `zn[j]` by
+`eta^j, j = 1, ..., q`. Then the value of `dt` is rescaled by `eta`, and
+`dtscale` is reset to `dt`.
+"""
+function rescale!(integrator::JVIntegrator)
+    eta = factor = integrator.eta
+    for j in 1:integrator.q
+        lmul!(factor, zn[j + 1])
+        factor *= eta
+    end
+    integrator.dt = integrator.dtscale * eta
+    integrator.dtscale = integrator.dt
+    return nothing
+end
+
+"""
+    restore!(integrator::JVIntegrator, saved_t)
+
+Restore the value of `t` to `saved_t` and undo the prediction. After execution
+of `restore!`, the Nordsieck array `zn` has the same values as before the
+prediction.
+"""
+function restore!(integrator::JVIntegrator, saved_t)
+    integrator.t = saved_t
+    for k in 1:integrator.q, j in integrator.q:-1:k
+        @. zn[j] -= zn[j+1]
+    end
     return nothing
 end
 
